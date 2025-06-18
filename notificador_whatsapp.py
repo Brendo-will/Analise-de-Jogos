@@ -1,68 +1,130 @@
 import pandas as pd
-from datetime import datetime, timedelta, date
-import pywhatkit
+from datetime import datetime, timedelta
+import requests
+import time
+import json
 import os
 
-# ====== CONFIGURAÇÕES ======
-NUMERO_DESTINO = "+5511949443193"  # Seu número com DDI
-PASTA_EXCEL = "."                 # Onde estão os arquivos
-LOG_ARQUIVO = "jogos_enviados.txt"
+# Configurações do Telegram
+TELEGRAM_TOKEN = 
+CHAT_ID = 
+ARQUIVO_ALERTADOS = "jogos_alertados.json"
 
-def encontrar_arquivo_do_dia():
-    hoje = date.today().strftime("%Y-%m-%d")
-    arquivos = [f for f in os.listdir(PASTA_EXCEL) if f.startswith(f"odds_{hoje}") and f.endswith(".xlsx")]
-    return max(arquivos, key=os.path.getctime) if arquivos else None
 
-def enviar_alertas():
-    ARQUIVO_EXCEL = encontrar_arquivo_do_dia()
-    if not ARQUIVO_EXCEL:
-        print("⚠️ Nenhum arquivo odds_ encontrado para hoje.")
+def carregar_alertados():
+    if os.path.exists(ARQUIVO_ALERTADOS):
+        with open(ARQUIVO_ALERTADOS, "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    return set()
+
+
+def salvar_alertados(alertados):
+    with open(ARQUIVO_ALERTADOS, "w", encoding="utf-8") as f:
+        json.dump(list(alertados), f, ensure_ascii=False, indent=2)
+
+
+def enviar_telegram_alerta(mensagem):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": mensagem,
+        "parse_mode": "Markdown"
+    }
+    response = requests.post(url, data=payload)
+    if response.status_code == 200:
+        print("📨 Alerta enviado com sucesso ao Telegram.")
+    else:
+        print(f"❌ Erro ao enviar alerta: {response.text}")
+
+
+def obter_ultimo_excel():
+    arquivos = [f for f in os.listdir() if f.startswith('odds_') and f.endswith('.xlsx')]
+    if not arquivos:
+        return None
+    return max(arquivos, key=os.path.getctime)
+
+
+def verificar_alertas():
+    EXCEL_PATH = obter_ultimo_excel()
+    if not EXCEL_PATH:
+        print("❌ Nenhum arquivo odds_ encontrado.")
         return
 
-    print(f"📂 Usando arquivo: {ARQUIVO_EXCEL}")
-    df = pd.read_excel(ARQUIVO_EXCEL)
+    df = pd.read_excel(EXCEL_PATH)
     agora = datetime.now()
-
-    # Carregar jogos já enviados
-    enviados = set()
-    if os.path.exists(LOG_ARQUIVO):
-        with open(LOG_ARQUIVO, "r") as f:
-            enviados = set(f.read().splitlines())
+    hoje = agora.date()
+    alertados = carregar_alertados()
+    novos_alertas = set()
 
     for _, row in df.iterrows():
+        hora_jogo_str = str(row['Horário']).strip().replace("'", "").replace('"', '').replace("’", "")
+
+        if any(x in hora_jogo_str for x in ["+", "HT", "FT", "ET"]) or not hora_jogo_str.replace(":", "").isdigit():
+            with open("horarios_invalidos.txt", "a", encoding="utf-8") as log:
+                log.write(f"Ignorado (não reconhecido): {hora_jogo_str}\n")
+            continue
+
+        if ":" not in hora_jogo_str:
+            hora_jogo_str = hora_jogo_str.zfill(2) + ":00"
+
         try:
-            horario_jogo_str = str(row["Horário"]).strip()
-            if ":" not in horario_jogo_str:
+            partes = hora_jogo_str.split(":")
+            hora_int = int(partes[0])
+            minuto_int = int(partes[1])
+
+            if hora_int > 23 or minuto_int > 59:
+                with open("horarios_invalidos.txt", "a", encoding="utf-8") as log:
+                    log.write(f"Ignorado (fora de range): {hora_jogo_str}\n")
                 continue
 
-            hora_jogo = datetime.strptime(horario_jogo_str, "%H:%M")
+            hora_jogo = datetime.strptime(hora_jogo_str, "%H:%M")
+            hora_jogo = hora_jogo.replace(year=hoje.year, month=hoje.month, day=hoje.day)
+            hora_alerta = hora_jogo + timedelta(minutes=15)
 
-            # Corrigir para jogos na madrugada
-            if hora_jogo.hour < 3 and agora.hour > 20:
-                hora_jogo = hora_jogo.replace(day=agora.day + 1)
-            else:
-                hora_jogo = hora_jogo.replace(day=agora.day)
-
-            hora_jogo = hora_jogo.replace(year=agora.year, month=agora.month)
-
-            # Evitar mensagens duplicadas
-            id_jogo = f"{row['Time 1']} x {row['Time 2']} {row['Horário']}"
-            if id_jogo in enviados:
+            identificador = f"{hora_jogo.strftime('%H:%M')}|{row['Time 1']} x {row['Time 2']}"
+            if identificador in alertados:
                 continue
 
-            # Se o jogo estiver entre agora e os próximos 10 minutos
-            if timedelta(minutes=0) <= (hora_jogo - agora) <= timedelta(minutes=10):
-                msg = f"🔔 Jogo em breve ({row['Horário']}):\n⚽ {row['Time 1']} x {row['Time 2']}\n🎯 Ação: {row['Ação Recomendada']}\n💡 {row['O que fazer']}"
-                if 'Link do Jogo' in row and isinstance(row['Link do Jogo'], str):
-                    msg += f"\n🔗 {row['Link do Jogo']}"
-                pywhatkit.sendwhatmsg_instantly(NUMERO_DESTINO, msg, wait_time=10)
-                print(f"✅ Mensagem enviada para: {id_jogo}")
+            acao = row.get('Ação Recomendada', '').strip()
+            arbitragem = row.get('Arbitragem?', 'Não').strip()
 
-                with open(LOG_ARQUIVO, "a") as f:
-                    f.write(id_jogo + "\n")
+            if acao == 'NADA' and arbitragem != 'Sim':
+                continue
+
+            if timedelta(seconds=0) <= agora - hora_alerta <= timedelta(minutes=1):
+                mensagem = f"""
+⏰ *Alerta 15 minutos após o início do jogo!*
+
+⚽ *{row['Time 1']}* x *{row['Time 2']}*
+🕒 *Início:* `{hora_jogo.strftime('%H:%M')}`
+🕒 *Alerta:* `{hora_alerta.strftime('%H:%M')}`
+
+💰 *Odds*:
+• {row['Time 1']}: `{row.get('Odd 1', '-')}` ({row.get('% Chance Time 1', '-')}%)
+• Empate: `{row.get('Odd X', '-')}`
+• {row['Time 2']}: `{row.get('Odd 2', '-')}` ({row.get('% Chance Time 2', '-')}%)
+
+📊 *Ação*: {acao}
+🎯 *Prognóstico*: {row.get('Prognóstico de Gols', '-')}
+⚖️ *Arbitragem?* {arbitragem}
+📉 *Gap de Odds*: {row.get('Gap de Odds', '-')}
+"""
+                enviar_telegram_alerta(mensagem.strip())
+                novos_alertas.add(identificador)
 
         except Exception as e:
-            print(f"❌ Erro ao processar jogo: {e}")
+            print(f"⚠️ Erro ao processar horário '{hora_jogo_str}': {e}")
+            with open("horarios_invalidos.txt", "a", encoding="utf-8") as log:
+                log.write(f"Erro de parsing: {hora_jogo_str} → {e}\n")
 
+    if novos_alertas:
+        alertados.update(novos_alertas)
+        salvar_alertados(alertados)
+
+
+# Execução contínua
 if __name__ == "__main__":
-    enviar_alertas()
+    while True:
+        print(f"🔍 Verificando alertas... {datetime.now().strftime('%H:%M:%S')}")
+        verificar_alertas()
+        time.sleep(20)
